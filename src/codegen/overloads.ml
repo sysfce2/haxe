@@ -8,24 +8,6 @@ let same_overload_args ?(get_vmtype) t1 t2 f1 f2 =
 		| None -> (fun t -> t)
 	in
 	let f_eq t1 t2 = type_iseq (f_transform t1) (f_transform t2) in
-	let compare_type_params () =
-		let rec loop params1 params2 = match params1,params2 with
-			| [],[] ->
-				true
-			| tp1 :: params1,tp2 :: params2 ->
-				let constraints_equal t1 t2 = match follow t1,follow t2 with
-					| TInst({cl_kind = KTypeParameter tl1},_),TInst({cl_kind = KTypeParameter tl2},_) ->
-						Ast.safe_for_all2 f_eq tl1 tl2
-					| _ ->
-						false
-				in
-				tp1.ttp_name = tp2.ttp_name && constraints_equal tp1.ttp_type tp2.ttp_type && loop params1 params2
-			| [],_
-			| _,[] ->
-				false
-		in
-		loop f1.cf_params f2.cf_params
-	in
 	let compare_arguments tl1 tl2 =
 		let rec loop tl1 tl2 = match tl1,tl2 with
 			| [],[] ->
@@ -39,14 +21,13 @@ let same_overload_args ?(get_vmtype) t1 t2 f1 f2 =
 		loop tl1 tl2
 	in
 	let compare_types () =
-		let t1 = follow (apply_params f1.cf_params (extract_param_types f2.cf_params) t1) in
-		match t1,follow t2 with
+		match follow t1,follow t2 with
 		| TFun(tl1,_),TFun(tl2,_) ->
 			compare_arguments tl1 tl2
 		| _ ->
 			false
 	in
-	compare_type_params () && compare_types ()
+	compare_types ()
 
 let collect_overloads map c i =
 	let acc = ref [] in
