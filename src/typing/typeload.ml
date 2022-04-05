@@ -759,12 +759,16 @@ type type_param_host =
 	| TPHMethod
 	| TPHEnumConstructor
 
+let create_type_param_class m path constraints meta p =
+	let c = mk_class m path p p in
+	c.cl_kind <- KTypeParameter constraints;
+	c.cl_meta <- meta;
+	c
+
 let rec type_type_param ctx host path get_params p tp =
 	let n = fst tp.tp_name in
-	let c = mk_class ctx.m.curmod (fst path @ [snd path],n) (pos tp.tp_name) (pos tp.tp_name) in
+	let c = create_type_param_class ctx.m.curmod (fst path @ [snd path],n) [] tp.tp_meta (pos tp.tp_name) in
 	c.cl_params <- type_type_params ctx host c.cl_path get_params p tp.tp_params;
-	c.cl_kind <- KTypeParameter [];
-	c.cl_meta <- tp.Ast.tp_meta;
 	if host = TPHEnumConstructor then c.cl_meta <- (Meta.EnumConstructorParam,[],null_pos) :: c.cl_meta;
 	let t = TInst (c,extract_param_types c.cl_params) in
 	if ctx.is_display_file && DisplayPosition.display_position#enclosed_in (pos tp.tp_name) then

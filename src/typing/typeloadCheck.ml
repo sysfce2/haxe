@@ -348,15 +348,25 @@ module Inheritance = struct
 		| _ -> typing_error "Should extend by using a class" p
 
 	let rec check_interface ctx missing c intf params =
+		let map = apply_params intf.cl_params params in
 		List.iter (fun (i2,p2) ->
-			check_interface ctx missing c i2 (List.map (apply_params intf.cl_params params) p2)
+			check_interface ctx missing c i2 (List.map map p2)
 		) intf.cl_implements;
 		let p = c.cl_name_pos in
 		let check_field f =
-			let t = (apply_params intf.cl_params params f.cf_type) in
+			let t = (map f.cf_type) in
 			let is_overload = ref false in
 			let make_implicit_field () =
-				let cf = {f with cf_overloads = []} in
+				let params = List.map (fun ttp -> match follow ttp.ttp_type with
+					| TInst({cl_kind = KTypeParameter tl1} as c,tl2) ->
+						let tl1 = List.map map tl1 in
+						let c = Typeload.create_type_param_class ctx.m.curmod c.cl_path tl1 c.cl_meta c.cl_pos in
+						let def = Option.map map ttp.ttp_default in
+						mk_type_param ttp.ttp_name (TInst(c,List.map map tl2)) def;
+					| _ ->
+						die "" __LOC__
+				) f.cf_params in
+				let cf = {f with cf_overloads = [];cf_type = t;cf_params = params} in
 				begin try
 					let cf' = PMap.find cf.cf_name c.cl_fields in
 					ctx.com.overload_cache#remove (c.cl_path,f.cf_name);
@@ -390,7 +400,7 @@ module Inheritance = struct
 						display_error ctx.com ("Field " ^ f.cf_name ^ " has different property access than in " ^ s_type_path intf.cl_path ^ " (" ^ s_kind f2.cf_kind ^ " should be " ^ s_kind f.cf_kind ^ ")") p
 					else try
 						let map1 = TClass.get_map_function  intf params in
-						valid_redefinition ctx map1 map2 f2 t2 f (apply_params intf.cl_params params f.cf_type)
+						valid_redefinition ctx map1 map2 f2 t2 f (map f.cf_type)
 					with
 						Unify_error l ->
 							if not (Meta.has Meta.CsNative c.cl_meta && (has_class_flag c CExtern)) then begin

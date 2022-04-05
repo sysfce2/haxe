@@ -21,6 +21,7 @@ let same_overload_args ?(get_vmtype) t1 t2 f1 f2 =
 		loop tl1 tl2
 	in
 	let compare_types () =
+		let t1 = monomorphs f1.cf_params t1 in
 		match follow t1,follow t2 with
 		| TFun(tl1,_),TFun(tl2,_) ->
 			compare_arguments tl1 tl2
