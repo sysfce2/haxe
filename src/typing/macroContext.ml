@@ -22,7 +22,6 @@ open DisplayTypes.DisplayMode
 open Common
 open Type
 open Typecore
-open Resolution
 open Error
 open Globals
 
@@ -41,15 +40,20 @@ module HxbWriterConfigWriterEval = HxbWriterConfig.WriterConfigWriter(EvalDataAp
 let macro_interp_cache = ref None
 
 let safe_decode com v expected t p f =
-	try
-		f ()
-	with MacroApi.Invalid_expr ->
+	let raise_decode_error s =
 		let path = [dump_path com;"decoding_error"] in
 		let ch = Path.create_file false ".txt" [] path  in
 		let errors = Interp.handle_decoding_error (output_string ch) v t in
 		List.iter (fun (s,i) -> Printf.fprintf ch "\nline %i: %s" i s) (List.rev errors);
 		close_out ch;
-		raise_typing_error (Printf.sprintf "Expected %s but got %s (see %s.txt for details)" expected (Interp.value_string v) (String.concat "/" path)) p
+		raise_typing_error (Printf.sprintf "%s (see %s.txt for details)" s (String.concat "/" path)) p
+	in
+
+	try f () with
+		| EvalContext.RunTimeException (VString emsg,_,_) ->
+			raise_decode_error (Printf.sprintf "Eval runtime exception: %s" emsg.sstring)
+		| MacroApi.Invalid_expr ->
+			raise_decode_error (Printf.sprintf "Expected %s but got %s" expected (Interp.value_string v))
 
 
 let macro_timer com l =
@@ -57,26 +61,26 @@ let macro_timer com l =
 
 let typing_timer ctx need_type f =
 	let t = Timer.timer ["typing"] in
-	let old = ctx.com.error_ext and oldp = ctx.pass and oldlocals = ctx.f.locals in
+	let ctx = if need_type && ctx.pass < PTypeField then begin
+		enter_field_typing_pass ctx.g ("typing_timer",[]);
+		TyperManager.clone_for_expr ctx ctx.e.curfun false
+	end else
+		ctx
+	in
+
+	let old = ctx.com.error_ext in
 	let restore_report_mode = disable_report_mode ctx.com in
-	(*
-		disable resumable errors... unless we are in display mode (we want to reach point of completion)
-	*)
-	(* if ctx.com.display.dms_kind = DMNone then ctx.com.error <- (fun e -> raise_error e); *) (* TODO: review this... *)
+	let restore_field_state = TypeloadFunction.save_field_state ctx in
 	ctx.com.error_ext <- (fun err -> raise_error { err with err_from_macro = true });
 
-	if need_type && ctx.pass < PTypeField then begin
-		enter_field_typing_pass ctx ("typing_timer",[] (* TODO: ? *));
-	end;
 	let exit() =
 		t();
 		ctx.com.error_ext <- old;
-		ctx.pass <- oldp;
-		ctx.f.locals <- oldlocals;
+		restore_field_state ();
 		restore_report_mode ();
 	in
 	try
-		let r = f() in
+		let r = f ctx in
 		exit();
 		r
 	with Error err ->
@@ -121,6 +125,9 @@ let make_macro_com_api com mcom p =
 			Interp.exc_string "unsupported"
 		);
 		get_module = (fun s ->
+			Interp.exc_string "unsupported"
+		);
+		include_module = (fun s ->
 			Interp.exc_string "unsupported"
 		);
 		after_init_macros = (fun f ->
@@ -189,10 +196,11 @@ let make_macro_com_api com mcom p =
 			| ParseSuccess(r,_,_) -> r
 			| ParseError(_,(msg,p),_) -> Parser.error msg p
 		);
-		type_expr = (fun e ->
-			Interp.exc_string "unsupported"
+		register_file_contents = (fun file content ->
+			let f = Lexer.resolve_file_content_pos file content in
+			Hashtbl.add Lexer.all_files file f;
 		);
-		flush_context = (fun f ->
+		type_expr = (fun e ->
 			Interp.exc_string "unsupported"
 		);
 		store_typed_expr = (fun te ->
@@ -200,15 +208,6 @@ let make_macro_com_api com mcom p =
 			snd (Typecore.store_typed_expr com te p)
 		);
 		allow_package = (fun v -> Common.allow_package com v);
-		set_js_generator = (fun gen ->
-			com.js_gen <- Some (fun() ->
-				Path.mkdir_from_path com.file;
-				let js_ctx = Genjs.alloc_ctx com (get_es_version com) in
-				let t = macro_timer com ["jsGenerator"] in
-				gen js_ctx;
-				t()
-			);
-		);
 		get_local_type = (fun() ->
 			Interp.exc_string "unsupported"
 		);
@@ -258,7 +257,7 @@ let make_macro_com_api com mcom p =
 				com.global_metadata <- (ExtString.String.nsplit s1 ".",m,config) :: com.global_metadata;
 			) meta;
 		);
-		add_module_check_policy = (fun sl il b i ->
+		add_module_check_policy = (fun sl il b ->
 			Interp.exc_string "unsupported"
 		);
 		register_define = (fun s data -> Define.register_user_define com.user_defines s data);
@@ -322,7 +321,7 @@ let make_macro_api ctx mctx p =
 	{
 		com_api with
 		MacroApi.get_type = (fun s ->
-			typing_timer ctx false (fun() ->
+			typing_timer ctx false (fun ctx ->
 				let path = parse_path s in
 				let tp = match List.rev (fst path) with
 					| s :: sl when String.length s > 0 && (match s.[0] with 'A'..'Z' -> true | _ -> false) ->
@@ -331,17 +330,17 @@ let make_macro_api ctx mctx p =
 						mk_type_path path
 				in
 				try
-					let m = Some (Typeload.load_instance ctx (make_ptp tp p) ParamSpawnMonos) in
+					let m = Some (Typeload.load_instance ctx (make_ptp tp p) ParamSpawnMonos LoadAny) in
 					m
 				with Error { err_message = Module_not_found _; err_pos = p2 } when p == p2 ->
 					None
 			)
 		);
 		MacroApi.resolve_type = (fun t p ->
-			typing_timer ctx false (fun() -> Typeload.load_complex_type ctx false (t,p))
+			typing_timer ctx false (fun ctx -> Typeload.load_complex_type ctx false LoadAny (t,p))
 		);
 		MacroApi.resolve_complex_type = (fun t ->
-			typing_timer ctx false (fun() ->
+			typing_timer ctx false (fun ctx ->
 				let rec load (t,_) =
 					((match t with
 					| CTPath ptp ->
@@ -394,17 +393,20 @@ let make_macro_api ctx mctx p =
 			)
 		);
 		MacroApi.get_module = (fun s ->
-			typing_timer ctx false (fun() ->
+			typing_timer ctx false (fun ctx ->
 				let path = parse_path s in
-				let m = List.map type_of_module_type (TypeloadModule.load_module ctx path p).m_types in
+				let m = List.map type_of_module_type (TypeloadModule.load_module ~origin:MDepFromMacro ctx path p).m_types in
 				m
 			)
 		);
-		MacroApi.type_expr = (fun e ->
-			typing_timer ctx true (fun() -> type_expr ctx e WithType.value)
+		MacroApi.include_module = (fun s ->
+			typing_timer ctx false (fun ctx ->
+				let path = parse_path s in
+				ignore(TypeloadModule.load_module ~origin:MDepFromMacroInclude ctx path p)
+			)
 		);
-		MacroApi.flush_context = (fun f ->
-			typing_timer ctx true f
+		MacroApi.type_expr = (fun e ->
+			typing_timer ctx true (fun ctx -> type_expr ctx e WithType.value)
 		);
 		MacroApi.get_local_type = (fun() ->
 			match ctx.c.get_build_infos() with
@@ -451,9 +453,9 @@ let make_macro_api ctx mctx p =
 		MacroApi.define_type = (fun v mdep ->
 			let cttype = mk_type_path ~sub:"TypeDefinition" (["haxe";"macro"],"Expr") in
 			let mctx = (match ctx.g.macros with None -> die "" __LOC__ | Some (_,mctx) -> mctx) in
-			let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal in
+			let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal LoadNormal in
 			let f () = Interp.decode_type_def v in
-			let m, tdef, pos = safe_decode ctx.com v "TypeDefinition" ttype p f in
+			let mpath, tdef, pos = safe_decode ctx.com v "TypeDefinition" ttype p f in
 			let has_native_meta = match tdef with
 				| EClass d -> Meta.has Meta.Native d.d_meta
 				| EEnum d -> Meta.has Meta.Native d.d_meta
@@ -462,10 +464,11 @@ let make_macro_api ctx mctx p =
 				| _ -> false
 			in
 			let add is_macro ctx =
-				let mdep = Option.map_default (fun s -> TypeloadModule.load_module ctx (parse_path s) pos) ctx.m.curmod mdep in
-				let mnew = TypeloadModule.type_module ctx ~dont_check_path:(has_native_meta) m (Path.UniqueKey.lazy_path mdep.m_extra.m_file) [tdef,pos] pos in
+				let mdep = Option.map_default (fun s -> TypeloadModule.load_module ~origin:MDepFromMacro ctx (parse_path s) pos) ctx.m.curmod mdep in
+				let mnew = TypeloadModule.type_module ctx.com ctx.g ~dont_check_path:(has_native_meta) mpath (ctx.com.file_keys#generate_virtual mpath ctx.com.compilation_step) [tdef,pos] pos in
 				mnew.m_extra.m_kind <- if is_macro then MMacro else MFake;
-				add_dependency mnew mdep;
+				add_dependency mnew mdep MDepFromMacro;
+				add_dependency mdep mnew MDepFromMacroDefine;
 				ctx.com.module_nonexistent_lut#clear;
 			in
 			add false ctx;
@@ -491,28 +494,35 @@ let make_macro_api ctx mctx p =
 			let mpath = Ast.parse_path m in
 			begin try
 				let m = ctx.com.module_lut#find mpath in
-				ignore(TypeloadModule.type_types_into_module ctx.com ctx.g m types pos)
+				if m != ctx.m.curmod then begin
+					let pos = { pfile = (Path.UniqueKey.lazy_path m.m_extra.m_file); pmin = 0; pmax = 0 } in
+					raise_typing_error_ext (make_error ~sub:[
+						make_error ~depth:1 (Custom "Previously defined here") pos
+					] (Custom (Printf.sprintf "Cannot redefine module %s" (s_type_path mpath))) p);
+				end else
+					ignore(TypeloadModule.type_types_into_module ctx.com ctx.g m types pos)
 			with Not_found ->
-				let mnew = TypeloadModule.type_module ctx mpath (Path.UniqueKey.lazy_path ctx.m.curmod.m_extra.m_file) types pos in
+				let mnew = TypeloadModule.type_module ctx.com ctx.g mpath (ctx.com.file_keys#generate_virtual mpath ctx.com.compilation_step) types pos in
 				mnew.m_extra.m_kind <- MFake;
-				add_dependency mnew ctx.m.curmod;
+				add_dependency mnew ctx.m.curmod MDepFromMacro;
+				add_dependency ctx.m.curmod mnew MDepFromMacroDefine;
 				ctx.com.module_nonexistent_lut#clear;
 			end
 		);
 		MacroApi.module_dependency = (fun mpath file ->
-			let m = typing_timer ctx false (fun() ->
+			let m = typing_timer ctx false (fun ctx ->
 				let old_deps = ctx.m.curmod.m_extra.m_deps in
-				let m = TypeloadModule.load_module ctx (parse_path mpath) p in
+				let m = TypeloadModule.load_module ~origin:MDepFromMacro ctx (parse_path mpath) p in
 				ctx.m.curmod.m_extra.m_deps <- old_deps;
 				m
 			) in
-			add_dependency m (create_fake_module ctx file);
+			add_dependency m (TypeloadCacheHook.create_fake_module ctx.com file) MDepFromMacro;
 		);
 		MacroApi.current_module = (fun() ->
 			ctx.m.curmod
 		);
 		MacroApi.cast_or_unify = (fun t e p ->
-			typing_timer ctx true (fun () ->
+			typing_timer ctx true (fun ctx ->
 				try
 					ignore(AbstractCast.cast_or_unify_raise ctx t e p);
 					true
@@ -527,20 +537,15 @@ let make_macro_api ctx mctx p =
 				ctx.com.global_metadata <- (ExtString.String.nsplit s1 ".",m,config) :: ctx.com.global_metadata;
 			) meta;
 		);
-		MacroApi.add_module_check_policy = (fun sl il b i ->
+		MacroApi.add_module_check_policy = (fun sl il b ->
 			let add ctx =
 				ctx.g.module_check_policies <- (List.fold_left (fun acc s -> (ExtString.String.nsplit s ".",List.map Obj.magic il,b) :: acc) ctx.g.module_check_policies sl);
 				ctx.com.module_lut#iter (fun _ m -> m.m_extra.m_check_policy <- TypeloadModule.get_policy ctx.g m.m_path);
 			in
-			let add_macro ctx = match ctx.g.macros with
+			add ctx;
+			match ctx.g.macros with
 				| None -> ()
-				| Some(_,mctx) -> add mctx;
-			in
-			let open CompilationCache in
-			match Obj.magic i with
-			| NormalContext -> add ctx
-			| MacroContext -> add_macro ctx
-			| NormalAndMacroContext -> add ctx; add_macro ctx;
+				| Some(_,mctx) -> add mctx
 		);
 		MacroApi.with_imports = (fun imports usings f ->
 			let restore_resolution = ctx.m.import_resolution#save in
@@ -552,7 +557,7 @@ let make_macro_api ctx mctx p =
 				List.iter (fun path ->
 					ImportHandling.init_using ctx path null_pos
 				) usings;
-				flush_pass ctx PConnectField ("with_imports",[] (* TODO: ? *));
+				flush_pass ctx.g PConnectField ("with_imports",[] (* TODO: ? *));
 				f()
 			in
 			let restore () =
@@ -583,24 +588,26 @@ let make_macro_api ctx mctx p =
 
 let init_macro_interp mctx mint =
 	let p = null_pos in
-	ignore(TypeloadModule.load_module mctx (["haxe";"macro"],"Expr") p);
-	ignore(TypeloadModule.load_module mctx (["haxe";"macro"],"Type") p);
+	ignore(TypeloadModule.load_module ~origin:MDepFromMacro mctx (["haxe";"macro"],"Expr") p);
+	ignore(TypeloadModule.load_module ~origin:MDepFromMacro mctx (["haxe";"macro"],"Type") p);
 	Interp.init mint;
 	macro_interp_cache := Some mint
 
 and flush_macro_context mint mctx =
 	let t = macro_timer mctx.com ["flush"] in
 	let mctx = (match mctx.g.macros with None -> die "" __LOC__ | Some (_,mctx) -> mctx) in
+	let main_module = Finalization.maybe_load_main mctx in
 	Finalization.finalize mctx;
-	let _, types, modules = Finalization.generate mctx in
+	let _, types, modules = Finalization.generate mctx main_module in
 	mctx.com.types <- types;
 	mctx.com.Common.modules <- modules;
+	let ectx = Exceptions.create_exception_context mctx in
 	(* we should maybe ensure that all filters in Main are applied. Not urgent atm *)
 	let expr_filters = [
-		"handle_abstract_casts",AbstractCast.handle_abstract_casts mctx;
-		"local_statics",LocalStatic.run mctx;
-		"Exceptions",Exceptions.filter mctx;
-		"captured_vars",CapturedVars.captured_vars mctx.com;
+		"handle_abstract_casts",AbstractCast.handle_abstract_casts;
+		"local_statics",LocalStatic.run;
+		"Exceptions",(fun _ -> Exceptions.filter ectx);
+		"captured_vars",(fun _ -> CapturedVars.captured_vars mctx.com);
 	] in
 	(*
 		some filters here might cause side effects that would break compilation server.
@@ -633,11 +640,22 @@ and flush_macro_context mint mctx =
 		| _ ->
 			()
 	in
+	(* Apply native paths for externs only *)
+	let maybe_apply_native_paths t =
+		let apply_native = match t with
+			| TClassDecl { cl_kind = KAbstractImpl a } -> a.a_extern && a.a_enum
+			| TEnumDecl e -> has_enum_flag e EnExtern
+			| _ -> false
+		in
+		if apply_native then Native.apply_native_paths t
+	in
 	let type_filters = [
 		FiltersCommon.remove_generic_base;
-		Exceptions.patch_constructors mctx;
+		Exceptions.patch_constructors mctx ectx;
 		(fun mt -> AddFieldInits.add_field_inits mctx.c.curclass.cl_path (RenameVars.init mctx.com) mctx.com mt);
+		Filters.update_cache_dependencies ~close_monomorphs:false mctx.com;
 		minimal_restore;
+		maybe_apply_native_paths
 	] in
 	let ready = fun t ->
 		FiltersCommon.apply_filters_once mctx expr_filters t;
@@ -680,6 +698,7 @@ let create_macro_interp api mctx =
 
 let create_macro_context com =
 	let com2 = Common.clone com true in
+	enter_stage com2 CInitMacrosDone;
 	com.get_macros <- (fun() -> Some com2);
 	com2.package_rules <- PMap.empty;
 	(* Inherit most display settings, but require normal typing. *)
@@ -697,7 +716,10 @@ let create_macro_context com =
 			[cp#clone]
 	) com.class_paths#as_list;
 	(* Eval _std must be in front so we don't look into hxnodejs or something. *)
-	com2.class_paths#add (Option.get !eval_std);
+	(* This can run before `TyperEntry.create`, so in order to display nice error when std is not found, this needs to be checked here too *)
+	(match !eval_std with
+	| Some std -> com2.class_paths#add std
+	| None -> Error.raise_std_not_found ());
 	let defines = adapt_defines_to_macro_context com2.defines; in
 	com2.defines.values <- defines.values;
 	com2.defines.defines_signature <- None;
@@ -726,8 +748,8 @@ let load_macro_module mctx com cpath display p =
 	(* Temporarily enter display mode while typing the macro. *)
 	let old = mctx.com.display in
 	if display then mctx.com.display <- com.display;
-	let mloaded = TypeloadModule.load_module mctx m p in
-	mctx.m <- {
+	let mloaded = TypeloadModule.load_module ~origin:MDepFromMacro mctx m p in
+	(* mctx.m <- {
 		curmod = mloaded;
 		import_resolution = new resolution_list ["import";s_type_path cpath];
 		own_resolution = None;
@@ -735,7 +757,7 @@ let load_macro_module mctx com cpath display p =
 		module_using = [];
 		import_statements = [];
 		is_display_file = (com.display.dms_kind <> DMNone && DisplayPosition.display_position#is_in_file (Path.UniqueKey.lazy_key mloaded.m_extra.m_file));
-	};
+	}; *)
 	mloaded,(fun () -> mctx.com.display <- old)
 
 let load_macro'' com mctx display cpath f p =
@@ -769,7 +791,7 @@ let load_macro'' com mctx display cpath f p =
 		restore();
 		if not com.is_macro_context then flush_macro_context mint mctx;
 		mctx.com.cached_macros#add (cpath,f) meth;
-		mctx.m <- {
+		(* mctx.m <- {
 			curmod = null_module;
 			import_resolution = new resolution_list ["import";s_type_path cpath];
 			own_resolution = None;
@@ -777,7 +799,7 @@ let load_macro'' com mctx display cpath f p =
 			module_using = [];
 			import_statements = [];
 			is_display_file = false;
-		};
+		}; *)
 		t();
 		meth
 
@@ -798,7 +820,7 @@ let load_macro ctx com mctx api display cpath f p =
 	let meth,mloaded = load_macro'' com mctx display cpath f p in
 	let _,_,{cl_path = cpath},_ = meth in
 	let call args =
-		add_dependency ctx.m.curmod mloaded;
+		add_dependency ctx.m.curmod mloaded MDepFromMacro;
 		do_call_macro ctx.com api cpath f args p
 	in
 	mctx, meth, call
@@ -826,7 +848,7 @@ let type_macro ctx mode cpath f (el:Ast.expr list) p =
 	in
 	let mpos = mfield.cf_pos in
 	let ctexpr = mk_type_path (["haxe";"macro"],"Expr") in
-	let expr = Typeload.load_instance mctx (make_ptp ctexpr p) ParamNormal in
+	let expr = Typeload.load_instance mctx (make_ptp ctexpr p) ParamNormal LoadNormal in
 	(match mode with
 	| MDisplay ->
 		raise Exit (* We don't have to actually call the macro. *)
@@ -835,18 +857,18 @@ let type_macro ctx mode cpath f (el:Ast.expr list) p =
 	| MBuild ->
 		let params = [TPType (make_ptp_th (mk_type_path ~sub:"Field" (["haxe";"macro"],"Expr")) null_pos)] in
 		let ctfields = mk_type_path ~params ([],"Array") in
-		let tfields = Typeload.load_instance mctx (make_ptp ctfields p) ParamNormal in
+		let tfields = Typeload.load_instance mctx (make_ptp ctfields p) ParamNormal LoadNormal in
 		unify mctx mret tfields mpos
 	| MMacroType ->
 		let cttype = mk_type_path (["haxe";"macro"],"Type") in
-		let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal in
+		let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal LoadNormal in
 		try
 			unify_raise mret ttype mpos;
 			(* TODO: enable this again in the future *)
 			(* warning ctx WDeprecated "Returning Type from @:genericBuild macros is deprecated, consider returning ComplexType instead" p; *)
 		with Error { err_message = Unify _ } ->
 			let cttype = mk_type_path ~sub:"ComplexType" (["haxe";"macro"],"Expr") in
-			let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal in
+			let ttype = Typeload.load_instance mctx (make_ptp cttype p) ParamNormal LoadNormal in
 			unify_raise mret ttype mpos;
 	);
 	(*
@@ -962,17 +984,19 @@ let type_macro ctx mode cpath f (el:Ast.expr list) p =
 								| None -> die "" __LOC__
 								| Some (_,_,fields) -> fields)
 							else
-								List.map Interp.decode_field (Interp.decode_array v)
+								let ct = make_ptp_th (mk_type_path ~sub:"Field" (["haxe";"macro"], "Expr")) null_pos in
+								let t = Typeload.load_complex_type mctx false LoadNormal ct in
+								List.map (fun f -> safe_decode ctx.com f "Field" t p (fun () -> Interp.decode_field f)) (Interp.decode_array v)
 						in
 						MSuccess (EVars [mk_evar ~t:(CTAnonymous fields,p) ("fields",null_pos)],p)
 					)
 				| MMacroType ->
 					"ComplexType",(fun () ->
 						let t = if v = Interp.vnull then
-							spawn_monomorph ctx.e p
+							spawn_monomorph ctx p
 						else try
 							let ct = Interp.decode_ctype v in
-							Typeload.load_complex_type ctx false ct;
+							Typeload.load_complex_type ctx false LoadNormal ct;
 						with MacroApi.Invalid_expr  | EvalContext.RunTimeException _ ->
 							Interp.decode_type v
 						in
@@ -990,12 +1014,11 @@ let type_macro ctx mode cpath f (el:Ast.expr list) p =
 	e
 
 let call_macro mctx args margs call p =
-	mctx.c.curclass <- null_class;
 	let el, _ = CallUnification.unify_call_args mctx args margs t_dynamic p false false false in
 	call (List.map (fun e -> try Interp.make_const e with Exit -> raise_typing_error "Argument should be a constant" e.epos) el)
 
 let resolve_init_macro com e =
-	let p = { pfile = "--macro " ^ e; pmin = -1; pmax = -1 } in
+	let p = fake_pos ("--macro " ^ e) in
 	let e = try
 		if String.get e (String.length e - 1) = ';' then raise_typing_error "Unexpected ;" p;
 		begin match ParserEntry.parse_expr_string com.defines e p raise_typing_error false with

@@ -17,21 +17,10 @@ let mk_untyped_call name p params =
 
 let api_inline2 com c field params p =
 	match c.cl_path, field, params with
-	| ([],"Type"),"enumIndex",[{ eexpr = TField (_,FEnum (en,f)) }] -> (match com.platform with
-		| Cs when en.e_extern && not (Meta.has Meta.HxGen en.e_meta) ->
-			(* We don't want to optimize enums from external sources; as they might change unexpectedly *)
-			(* and since native C# enums don't have the concept of index - they have rather a value, *)
-			(* which can't be mapped to a native API - this kind of substitution is dangerous *)
-			None
-		| _ ->
-			Some (mk (TConst (TInt (Int32.of_int f.ef_index))) com.basic.tint p))
+	| ([],"Type"),"enumIndex",[{ eexpr = TField (_,FEnum (en,f)) }] ->
+		Some (mk (TConst (TInt (Int32.of_int f.ef_index))) com.basic.tint p)
 	| ([],"Type"),"enumIndex",[{ eexpr = TCall({ eexpr = TField (_,FEnum (en,f)) },pl) }] when List.for_all (fun e -> not (has_side_effect e)) pl ->
-		(match com.platform with
-			| Cs when en.e_extern && not (Meta.has Meta.HxGen en.e_meta) ->
-				(* see comment above *)
-				None
-			| _ ->
-				Some (mk (TConst (TInt (Int32.of_int f.ef_index))) com.basic.tint p))
+		Some (mk (TConst (TInt (Int32.of_int f.ef_index))) com.basic.tint p)
 	| ([],"Std"),"int",[{ eexpr = TConst (TInt _) } as e] ->
 		Some { e with epos = p }
 	| ([],"String"),"fromCharCode",[{ eexpr = TConst (TInt i) }] when i > 0l && i < 128l ->
@@ -99,10 +88,6 @@ let api_inline2 com c field params p =
 			None (* out range, keep platform-specific behavior *)
 		| _ ->
 			Some { eexpr = TConst (TInt (Int32.of_float (floor f))); etype = com.basic.tint; epos = p })
-	| (["cs"],"Lib"),("fixed" | "checked" | "unsafe"),[e] ->
-			Some (mk_untyped_call ("__" ^ field ^ "__") p [e])
-	| (["cs"],"Lib"),("lock"),[obj;block] ->
-			Some (mk_untyped_call ("__lock__") p [obj;mk_block block])
 	| (["java"],"Lib"),("lock"),[obj;block] ->
 			Some (mk_untyped_call ("__lock__") p [obj;mk_block block])
 	| _ ->
@@ -111,7 +96,7 @@ let api_inline2 com c field params p =
 let api_inline ctx c field params p =
 	let mk_typeexpr path =
 		let m = (try ctx.com.module_lut#find path with Not_found -> die "" __LOC__) in
-		add_dependency ctx.m.curmod m;
+		add_dependency ctx.m.curmod m MDepFromTyping;
 		Option.get (ExtList.List.find_map (function
 			| TClassDecl cl when cl.cl_path = path -> Some (Texpr.Builder.make_static_this cl p)
 			| _ -> None
@@ -176,11 +161,9 @@ let api_inline ctx c field params p =
 			Some (Texpr.Builder.fcall (Texpr.Builder.make_static_this c p) "__implements" [o;t] tbool p)
 		else
 			Some (Texpr.Builder.fcall (eJsSyntax()) "instanceof" [o;t] tbool p)
-	| (["cs" | "java"],"Lib"),("nativeArray"),[{ eexpr = TArrayDecl args } as edecl; _]
 	| (["haxe";"ds";"_Vector"],"Vector_Impl_"),("fromArrayCopy"),[{ eexpr = TArrayDecl args } as edecl] -> (try
 			let platf = match ctx.com.platform with
-				| Cs -> "cs"
-				| Java -> "java"
+				| Jvm -> "jvm"
 				| _ -> raise Exit
 			in
 			let mpath = if field = "fromArrayCopy" then
@@ -702,6 +685,7 @@ let rec type_inline ctx cf f ethis params tret config p ?(self_calling_closure=f
 				raise_typing_error "Could not inline `this` outside of an instance context" po
 			)
 		| TVar (v,eo) ->
+			if has_var_flag v VStatic then raise_typing_error "Inline functions cannot have static locals" v.v_pos;
 			{ e with eexpr = TVar ((state#declare v).i_subst,opt (map false false) eo)}
 		| TReturn eo when not state#in_local_fun ->
 			if not term then begin
@@ -716,14 +700,6 @@ let rec type_inline ctx cf f ethis params tret config p ?(self_calling_closure=f
 			| Some e ->
 				state#set_return_value;
 				map term false e)
-		| TFor (v,e1,e2) ->
-			let i = state#declare v in
-			let e1 = map false false e1 in
-			let old = !in_loop in
-			in_loop := true;
-			let e2 = map false false e2 in
-			in_loop := old;
-			{ e with eexpr = TFor (i.i_subst,e1,e2) }
 		| TWhile (cond,eloop,flag) ->
 			let cond = map false false cond in
 			let old = !in_loop in
@@ -763,7 +739,7 @@ let rec type_inline ctx cf f ethis params tret config p ?(self_calling_closure=f
 					let r = match e.eexpr with
 					| TReturn _ -> true
 					| TFunction _ -> false
-					| TIf (_,_,None) | TSwitch {switch_default = None} | TFor _ | TWhile (_,_,NormalWhile) -> false (* we might not enter this code at all *)
+					| TIf (_,_,None) | TSwitch {switch_default = None} | TWhile (_,_,NormalWhile) -> false (* we might not enter this code at all *)
 					| TTry (a, catches) -> List.for_all has_term_return (a :: List.map snd catches)
 					| TIf (cond,a,Some b) -> has_term_return cond || (has_term_return a && has_term_return b)
 					| TSwitch ({switch_default = Some def} as switch) -> has_term_return switch.switch_subject || List.for_all has_term_return (def :: List.map (fun case -> case.case_expr) switch.switch_cases)
@@ -928,7 +904,7 @@ and inline_rest_params ctx f params map_type p =
 						in
 						let array = mk (TArrayDecl params) (ctx.t.tarray t_params) p in
 						(* haxe.Rest.of(array) *)
-						let e = make_static_call ctx c cf (apply_params a.a_params [t]) [array] (TAbstract(a,[t_params])) p in
+						let e =CallUnification.make_static_call_better ctx c cf [t] [array] (TAbstract(a,[t_params])) p in
 						[e]
 					| _ ->
 						die ~p:v.v_pos "Unexpected rest arguments type" __LOC__

@@ -211,7 +211,7 @@ let type_module_type ctx t p =
 		| TEnumDecl e ->
 			mk (TTypeExpr (TEnumDecl e)) e.e_type p
 		| TTypeDecl s ->
-			let t = apply_typedef s (List.map (fun _ -> spawn_monomorph ctx.e p) s.t_params) in
+			let t = apply_typedef s (List.map (fun _ -> spawn_monomorph ctx p) s.t_params) in
 			DeprecationCheck.check_typedef (create_deprecation_context ctx) s p;
 			(match follow t with
 			| TEnum (e,params) ->
@@ -330,8 +330,12 @@ let unify_static_extension ctx e t p =
 		e
 	end
 
+type from_kind =
+	| FromType
+	| FromField
+
 let get_abstract_froms ctx a pl =
-	let l = List.map (apply_params a.a_params pl) a.a_from in
+	let l = List.map (fun t -> FromType,apply_params a.a_params pl t) a.a_from in
 	List.fold_left (fun acc (t,f) ->
 		(* We never want to use the @:from we're currently in because that's recursive (see #10604) *)
 		if f == ctx.f.curfield then
@@ -342,7 +346,7 @@ let get_abstract_froms ctx a pl =
 		| TFun ([_,_,v],t) ->
 			(try
 				ignore(type_eq EqStrict t (TAbstract(a,List.map duplicate pl))); (* unify fields monomorphs *)
-				v :: acc
+				(FromField,v) :: acc
 			with Unify_error _ ->
 				acc)
 		| _ ->
@@ -366,3 +370,13 @@ let safe_nav_branch ctx sn f_then =
 	(match sn.sn_temp_var with
 	| None -> eif
 	| Some evar -> { eif with eexpr = TBlock [evar; eif] })
+
+let get_safe_nav_base ctx eobj =
+	match (Texpr.skip eobj).eexpr with
+	| TLocal _ | TTypeExpr _ | TConst _ ->
+		eobj, None
+	| _ ->
+		let v = alloc_var VGenerated "tmp" eobj.etype eobj.epos in
+		let temp_var = mk (TVar(v, Some eobj)) ctx.t.tvoid v.v_pos in
+		let eobj = mk (TLocal v) v.v_type v.v_pos in
+		eobj, Some temp_var

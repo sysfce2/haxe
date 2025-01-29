@@ -235,7 +235,7 @@ and jit_expr jit return e =
 		List.iter (fun var -> ignore(get_capture_slot jit var)) jit_closure.captures_outside_scope;
 		let captures = ExtList.List.filter_map (fun (i,vid,declared) ->
 			if declared then None
-			else Some (i,fst (try Hashtbl.find jit.captures vid with Not_found -> Error.raise_typing_error "Something went wrong" e.epos))
+			else Some (i,fst (try Hashtbl.find jit.captures vid with Not_found -> Error.raise_typing_error (Printf.sprintf "Could not find capture variable %i" vid) e.epos))
 		) captures in
 		let mapping = Array.of_list captures in
 		emit_closure ctx mapping eci hasret exec fl
@@ -304,7 +304,7 @@ and jit_expr jit return e =
 	| TWhile(e1,e2,flag) ->
 		let rec has_continue e = match e.eexpr with
 			| TContinue -> true
-			| TWhile _ | TFor _ | TFunction _ -> false
+			| TWhile _ | TFunction _ -> false
 			| _ -> check_expr has_continue e
 		in
 		let exec_cond = jit_expr jit false e1 in
@@ -632,8 +632,6 @@ and jit_expr jit return e =
 	| TUnop(op,flag,v1) ->
 		unop jit op flag v1 e.epos
 	(* rewrites/skips *)
-	| TFor(v,e1,e2) ->
-		loop (Texpr.for_remap (ctx.curapi.MacroApi.get_com()).Common.basic v e1 e2 e.epos)
 	| TParenthesis e1 | TMeta(_,e1) | TCast(e1,None) ->
 		loop e1
 	| TIdent s ->
@@ -650,12 +648,12 @@ and jit_expr jit return e =
 			begin match e.eexpr with
 			| TCall _ | TNew _
 			| TVar({v_kind = VUser _},_)
-			| TFor _ | TIf _ | TWhile _ | TSwitch _ | TTry _
+			| TIf _ | TWhile _ | TSwitch _ | TTry _
 			| TReturn _ | TBreak | TContinue | TThrow _ | TCast(_,Some _) ->
 				wrap()
 			| TUnop((Increment | Decrement),_,e1) | TBinop((OpAssign | OpAssignOp _),e1,_) ->
 				begin match (Texpr.skip e1).eexpr with
-				| TLocal {v_kind = VGenerated | VInlined | VInlinedConstructorVariable | VExtractorVariable} ->
+				| TLocal {v_kind = VGenerated | VInlined | VInlinedConstructorVariable _ | VExtractorVariable} ->
 					f
 				| _ ->
 					wrap()

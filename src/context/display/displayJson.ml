@@ -49,10 +49,10 @@ class display_handler (jsonrpc : jsonrpc_handler) com (cs : CompilationCache.t) 
 
 	method get_cs = cs
 
-	method enable_display mode =
+	method enable_display ?(skip_define=false) mode =
 		com.display <- create mode;
 		Parser.display_mode := mode;
-		Common.define_value com Define.Display "1"
+		if not skip_define then Common.define_value com Define.Display "1"
 
 	method set_display_file was_auto_triggered requires_offset =
 		let file = jsonrpc#get_opt_param (fun () ->
@@ -99,13 +99,13 @@ class display_handler (jsonrpc : jsonrpc_handler) com (cs : CompilationCache.t) 
 			com.file_contents <- file_contents;
 
 			match files with
-			| [] | [_] -> DisplayPosition.display_position#set { pfile = file; pmin = pos; pmax = pos; };
+			| [] -> DisplayPosition.display_position#set { pfile = file; pmin = pos; pmax = pos; };
 			| _ -> DisplayPosition.display_position#set_files files;
 		end
 end
 
 class hxb_reader_api_com
-	~(headers_only : bool)
+	~(full_restore : bool)
 	(com : Common.context)
 	(cc : CompilationCache.context_cache)
 = object(self)
@@ -116,7 +116,9 @@ class hxb_reader_api_com
 			m_path = path;
 			m_types = [];
 			m_statics = None;
-			m_extra = mc.mc_extra
+			(* Creating a new m_extra because if we keep the same reference, display requests *)
+			(* can alter it with bad data (for example adding dependencies that are not cached) *)
+			m_extra = { mc.mc_extra with m_deps = mc.mc_extra.m_deps; m_display_deps = None }
 		}
 
 	method add_module (m : module_def) =
@@ -137,8 +139,8 @@ class hxb_reader_api_com
 			cc#find_module m_path
 		with Not_found ->
 			let mc = cc#get_hxb_module m_path in
-			let reader = new HxbReader.hxb_reader mc.mc_path com.hxb_reader_stats in
-			fst (reader#read_chunks_until (self :> HxbReaderApi.hxb_reader_api) mc.mc_chunks (if headers_only then MTF else EOM))
+			let reader = new HxbReader.hxb_reader mc.mc_path com.hxb_reader_stats (Some cc#get_string_pool_arr) (Common.defined com Define.HxbTimes) in
+			fst (reader#read_chunks_until (self :> HxbReaderApi.hxb_reader_api) mc.mc_chunks (if full_restore then EOM else MTF) full_restore)
 
 	method basic_types =
 		com.basic
@@ -148,10 +150,13 @@ class hxb_reader_api_com
 
 	method read_expression_eagerly (cf : tclass_field) =
 		false
+
+	method make_lazy_type t f =
+		TLazy (make_unforced_lazy t f "com-api")
 end
 
-let find_module ~(headers_only : bool) com cc path =
-	(new hxb_reader_api_com ~headers_only com cc)#find_module path
+let find_module ~(full_restore : bool) com cc path =
+	(new hxb_reader_api_com ~full_restore com cc)#find_module path
 
 type handler_context = {
 	com : Common.context;
@@ -167,7 +172,7 @@ let handler =
 	let l = [
 		"initialize", (fun hctx ->
 			supports_resolve := hctx.jsonrpc#get_opt_param (fun () -> hctx.jsonrpc#get_bool_param "supportsResolve") false;
-			DisplayException.max_completion_items := hctx.jsonrpc#get_opt_param (fun () -> hctx.jsonrpc#get_int_param "maxCompletionItems") 0;
+			ServerConfig.max_completion_items := hctx.jsonrpc#get_opt_param (fun () -> hctx.jsonrpc#get_int_param "maxCompletionItems") 0;
 			let exclude = hctx.jsonrpc#get_opt_param (fun () -> hctx.jsonrpc#get_array_param "exclude") [] in
 			DisplayToplevel.exclude := List.map (fun e -> match e with JString s -> s | _ -> die "" __LOC__) exclude;
 			let methods = Hashtbl.fold (fun k _ acc -> (jstring k) :: acc) h [] in
@@ -207,13 +212,9 @@ let handler =
 		);
 		"display/diagnostics", (fun hctx ->
 			hctx.display#set_display_file false false;
-			hctx.display#enable_display DMNone;
+			hctx.display#enable_display ~skip_define:true DMNone;
+			hctx.com.display <- { hctx.com.display with dms_display_file_policy = DFPAlso; dms_per_file = true; dms_populate_cache = true };
 			hctx.com.report_mode <- RMDiagnostics (List.map (fun (f,_) -> f) hctx.com.file_contents);
-
-			(match hctx.com.file_contents with
-			| [file, None] ->
-				hctx.com.display <- { hctx.com.display with dms_display_file_policy = DFPAlso; dms_per_file = true; dms_populate_cache = !ServerConfig.populate_cache_from_display};
-			| _ -> ());
 		);
 		"display/implementation", (fun hctx ->
 			hctx.display#set_display_file false true;
@@ -310,6 +311,15 @@ let handler =
 				) all))
 			)
 		);
+		"server/resetCache", (fun hctx ->
+			hctx.com.cs#clear;
+			supports_resolve := false;
+			DisplayException.reset();
+			ServerConfig.reset();
+			hctx.send_result (jobject [
+				"success", jbool true
+			]);
+		);
 		"server/readClassPaths", (fun hctx ->
 			hctx.com.callbacks#add_after_init_macros (fun () ->
 				let cc = hctx.display#get_cs#get_context (Define.get_signature hctx.com.defines) in
@@ -340,12 +350,13 @@ let handler =
 			let path = Path.parse_path (hctx.jsonrpc#get_string_param "path") in
 			let cs = hctx.display#get_cs in
 			let cc = cs#get_context sign in
+			let full_restore = Define.defined hctx.com.defines Define.DisableHxbOptimizations in
 			let m = try
-				find_module ~headers_only:true hctx.com cc path
+				find_module ~full_restore hctx.com cc path
 			with Not_found ->
 				hctx.send_error [jstring "No such module"]
 			in
-			hctx.send_result (generate_module (cc#get_hxb) (find_module ~headers_only:true hctx.com cc) m)
+			hctx.send_result (generate_module (cc#get_hxb) (find_module ~full_restore hctx.com cc) m)
 		);
 		"server/type", (fun hctx ->
 			let sign = Digest.from_hex (hctx.jsonrpc#get_string_param "signature") in
@@ -353,7 +364,7 @@ let handler =
 			let typeName = hctx.jsonrpc#get_string_param "typeName" in
 			let cc = hctx.display#get_cs#get_context sign in
 			let m = try
-				find_module ~headers_only:true hctx.com cc path
+				find_module ~full_restore:true hctx.com cc path
 			with Not_found ->
 				hctx.send_error [jstring "No such module"]
 			in
@@ -453,27 +464,21 @@ let handler =
 				l := jstring ("Legacy completion " ^ (if b then "enabled" else "disabled")) :: !l;
 				()
 			) ();
-			hctx.jsonrpc#get_opt_param (fun () ->
-				let b = hctx.jsonrpc#get_bool_param "populateCacheFromDisplay" in
-				ServerConfig.populate_cache_from_display := b;
-				l := jstring ("Compilation cache refill from display " ^ (if b then "enabled" else "disabled")) :: !l;
-				()
-			) ();
 			hctx.send_result (jarray !l)
 		);
 		"server/memory",(fun hctx ->
-			let j = Memory.get_memory_json hctx.display#get_cs MCache in
+			let j = DisplayMemory.get_memory_json hctx.display#get_cs MCache in
 			hctx.send_result j
 		);
 		"server/memory/context",(fun hctx ->
 			let sign = Digest.from_hex (hctx.jsonrpc#get_string_param "signature") in
-			let j = Memory.get_memory_json hctx.display#get_cs (MContext sign) in
+			let j = DisplayMemory.get_memory_json hctx.display#get_cs (MContext sign) in
 			hctx.send_result j
 		);
 		"server/memory/module",(fun hctx ->
 			let sign = Digest.from_hex (hctx.jsonrpc#get_string_param "signature") in
 			let path = Path.parse_path (hctx.jsonrpc#get_string_param "path") in
-			let j = Memory.get_memory_json hctx.display#get_cs (MModule(sign,path)) in
+			let j = DisplayMemory.get_memory_json hctx.display#get_cs (MModule(sign,path)) in
 			hctx.send_result j
 		);
 		(* TODO: wait till gama complains about the naming, then change it to something else *)

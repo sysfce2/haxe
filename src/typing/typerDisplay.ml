@@ -178,7 +178,7 @@ let raise_toplevel ctx dk with_type (subject,psubject) =
 	DisplayToplevel.collect_and_raise ctx (match dk with DKPattern _ -> TKPattern psubject | _ -> TKExpr psubject) with_type (CRToplevel expected_type) (subject,psubject) psubject
 
 let display_dollar_type ctx p make_type =
-	let mono = spawn_monomorph ctx.e p in
+	let mono = spawn_monomorph ctx p in
 	let doc = doc_from_string "Outputs type of argument as a warning and uses argument as value" in
 	let arg = ["expression",false,mono] in
 	begin match ctx.com.display.dms_kind with
@@ -310,7 +310,7 @@ let rec handle_signature_display ctx e_ast with_type =
 			in
 			handle_call tl el e1.epos
 		| ENew(ptp,el) ->
-			let t = Abstract.follow_with_forward_ctor (Typeload.load_instance ctx ptp ParamSpawnMonos) in
+			let t = Abstract.follow_with_forward_ctor (Typeload.load_instance ctx ptp ParamSpawnMonos LoadNormal) in
 			handle_call (find_constructor_types t) el ptp.pos_full
 		| EArray(e1,e2) ->
 			let e1 = type_expr ctx e1 WithType.value in
@@ -518,7 +518,7 @@ and display_expr ctx e_ast e dk mode with_type p =
 		let fields = DisplayFields.collect ctx e_ast e dk with_type p in
 		let item = completion_item_of_expr ctx e in
 		let iterator = try
-			let it = (ForLoop.IterationKind.of_texpr ~resume:true ctx e (fun _ -> false) e.epos) in
+			let it = (ForLoop.IterationKind.of_texpr ~resume:true ctx e None e.epos) in
 			match follow it.it_type with
 				| TDynamic _ ->  None
 				| t -> Some t
@@ -583,7 +583,6 @@ let handle_display ctx e_ast dk mode with_type =
 			raise_toplevel ctx dk with_type (s_type_path path,p)
 	| DisplayException(DisplayFields ({fkind = CRTypeHint} as r)) when (match fst e_ast with ENew _ -> true | _ -> false) ->
 		let timer = Timer.timer ["display";"toplevel";"filter ctors"] in
-		ctx.pass <- PBuildClass;
 		let l = List.filter (fun item ->
 			let is_private_to_current_module mt =
 				(* Remove the _Module nonsense from the package *)

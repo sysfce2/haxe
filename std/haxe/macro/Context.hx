@@ -396,6 +396,15 @@ class Context {
 	}
 
 	/**
+		Parse file content for newlines, allowing positions to be resolved
+		properly inside that file later on (using `Context.parseInlineString`
+		for example). Works with both real and virtual files.
+	**/
+	public static function registerFileContents(file:String, content:String):Void {
+		load("register_file_contents", 2)(file, content);
+	}
+
+	/**
 		Builds an expression from `v`.
 
 		This method generates AST nodes depending on the macro-runtime value of
@@ -466,7 +475,7 @@ class Context {
 		is done running initialization macros, when typing begins.
 
 		`onAfterInitMacros` should be used to delay typer-dependant code from
-		your initalization macros, to properly separate configuration phase and
+		your initialization macros, to properly separate configuration phase and
 		actual typing.
 	**/
 	public static function onAfterInitMacros(callback:Void->Void):Void {
