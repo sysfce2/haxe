@@ -33,7 +33,7 @@ function Install-Init {
 	}
 	
 	# reset PATH to prevent conflicting cygwin or existing install
-	Set-Item -Path env:PATH -Value "$Neko;$CygRoot\usr\x86_64-w64-mingw32\bin;$Opam;$CygRoot\bin;$WinSysPath"
+	Set-Item -Path env:PATH -Value "$CygRoot\usr\x86_64-w64-mingw32\bin;$CygRoot\bin;$Opam;$Neko;$WinSysPath"
 
 	# set OPAM root dir
 	Set-Item -Path env:OPAMROOT -Value "$OpamRepo"
