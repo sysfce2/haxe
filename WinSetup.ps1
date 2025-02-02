@@ -85,6 +85,6 @@ public static extern int SendMessageTimeout(IntPtr hWnd, int Msg, IntPtr wParam,
 }
 
 Install-Init
-#Install-Opam
+Install-Opam
 Install-Haxe-Deps
-#Setup-Paths
+Setup-Paths
